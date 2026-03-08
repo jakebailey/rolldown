@@ -598,31 +598,56 @@ impl<'me, 'ast: 'me> Visit<'ast> for AstScanner<'me, 'ast> {
 }
 
 impl<'me, 'ast: 'me> AstScanner<'me, 'ast> {
-  /// Unwrap parenthesized/sequence expressions and invalidate any spread-safe
-  /// symbol found at the base. This handles patterns like `(o)`, `(void 0, o)`,
-  /// `(1, 2, 3, o)` etc.
-  fn invalidate_spread_safe_from_expr(&mut self, mut expr: &Expression<'ast>) {
-    loop {
-      match expr {
-        Expression::ParenthesizedExpression(paren) => {
-          expr = &paren.expression;
-        }
-        Expression::SequenceExpression(seq) => {
-          if let Some(last) = seq.expressions.last() {
-            expr = last;
-          } else {
-            return;
+  /// Recursively walk an expression and remove any spread-safe symbol
+  /// referenced anywhere within it. This ensures that passing an object
+  /// through any wrapper (parentheses, sequences, conditionals, logical
+  /// expressions, etc.) correctly invalidates it.
+  fn invalidate_spread_safe_from_expr(&mut self, expr: &Expression<'ast>) {
+    if self.spread_safe_symbol_ids.is_empty() {
+      return;
+    }
+    match expr {
+      Expression::Identifier(ident) => {
+        if let Some(ref_id) = ident.reference_id.get() {
+          if let Some(sym) = self.result.symbol_ref_db.ast_scopes.symbol_id_for(ref_id) {
+            self.spread_safe_symbol_ids.remove(&sym);
           }
         }
-        _ => break,
       }
-    }
-    if let Expression::Identifier(ident) = expr {
-      if let Some(ref_id) = ident.reference_id.get() {
-        if let Some(sym) = self.result.symbol_ref_db.ast_scopes.symbol_id_for(ref_id) {
-          self.spread_safe_symbol_ids.remove(&sym);
+      Expression::ParenthesizedExpression(paren) => {
+        self.invalidate_spread_safe_from_expr(&paren.expression);
+      }
+      Expression::SequenceExpression(seq) => {
+        for e in &seq.expressions {
+          self.invalidate_spread_safe_from_expr(e);
         }
       }
+      Expression::ConditionalExpression(cond) => {
+        self.invalidate_spread_safe_from_expr(&cond.consequent);
+        self.invalidate_spread_safe_from_expr(&cond.alternate);
+      }
+      Expression::LogicalExpression(logic) => {
+        self.invalidate_spread_safe_from_expr(&logic.left);
+        self.invalidate_spread_safe_from_expr(&logic.right);
+      }
+      Expression::AssignmentExpression(assign) => {
+        self.invalidate_spread_safe_from_expr(&assign.right);
+      }
+      Expression::TSAsExpression(ts) => {
+        self.invalidate_spread_safe_from_expr(&ts.expression);
+      }
+      Expression::TSSatisfiesExpression(ts) => {
+        self.invalidate_spread_safe_from_expr(&ts.expression);
+      }
+      Expression::TSNonNullExpression(ts) => {
+        self.invalidate_spread_safe_from_expr(&ts.expression);
+      }
+      Expression::TSTypeAssertion(ts) => {
+        self.invalidate_spread_safe_from_expr(&ts.expression);
+      }
+      // For any other expression form, we don't recurse — it can't
+      // transparently pass through the same object reference.
+      _ => {}
     }
   }
 

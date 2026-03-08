@@ -1065,8 +1065,57 @@ mod test {
     invalidate_call_args_in_stmt(stmt, set, scopes);
   }
 
-  /// Walk the statement looking for call expressions, and remove any spread-safe
-  /// symbols that appear as arguments.
+  /// Recursively walk an expression and remove any spread-safe symbol
+  /// referenced anywhere within it.
+  fn walk_and_invalidate(expr: &Expression, set: &mut FxHashSet<SymbolId>, scopes: &AstScopes) {
+    if set.is_empty() {
+      return;
+    }
+    match expr {
+      Expression::Identifier(ident) => {
+        if let Some(ref_id) = ident.reference_id.get() {
+          if let Some(sym) = scopes.symbol_id_for(ref_id) {
+            set.remove(&sym);
+          }
+        }
+      }
+      Expression::ParenthesizedExpression(paren) => {
+        walk_and_invalidate(&paren.expression, set, scopes);
+      }
+      Expression::SequenceExpression(seq) => {
+        for e in &seq.expressions {
+          walk_and_invalidate(e, set, scopes);
+        }
+      }
+      Expression::ConditionalExpression(cond) => {
+        walk_and_invalidate(&cond.consequent, set, scopes);
+        walk_and_invalidate(&cond.alternate, set, scopes);
+      }
+      Expression::LogicalExpression(logic) => {
+        walk_and_invalidate(&logic.left, set, scopes);
+        walk_and_invalidate(&logic.right, set, scopes);
+      }
+      Expression::AssignmentExpression(assign) => {
+        walk_and_invalidate(&assign.right, set, scopes);
+      }
+      Expression::TSAsExpression(ts) => {
+        walk_and_invalidate(&ts.expression, set, scopes);
+      }
+      Expression::TSSatisfiesExpression(ts) => {
+        walk_and_invalidate(&ts.expression, set, scopes);
+      }
+      Expression::TSNonNullExpression(ts) => {
+        walk_and_invalidate(&ts.expression, set, scopes);
+      }
+      Expression::TSTypeAssertion(ts) => {
+        walk_and_invalidate(&ts.expression, set, scopes);
+      }
+      _ => {}
+    }
+  }
+
+  /// Walk a statement looking for call expressions and invalidate spread-safe
+  /// symbols found in their arguments or receivers.
   fn invalidate_call_args_in_stmt(
     stmt: &Statement,
     set: &mut FxHashSet<SymbolId>,
@@ -1075,7 +1124,6 @@ mod test {
     if set.is_empty() {
       return;
     }
-    // Simple recursive walk to find call expressions in the statement
     match stmt {
       Statement::ExpressionStatement(expr) => {
         invalidate_call_args_in_expr(&expr.expression, set, scopes);
@@ -1091,37 +1139,6 @@ mod test {
     }
   }
 
-  /// Unwrap parenthesized/sequence expressions and remove any found
-  /// spread-safe symbol from the set.
-  fn unwrap_and_invalidate(
-    mut expr: &Expression,
-    set: &mut FxHashSet<SymbolId>,
-    scopes: &AstScopes,
-  ) {
-    loop {
-      match expr {
-        Expression::ParenthesizedExpression(paren) => {
-          expr = &paren.expression;
-        }
-        Expression::SequenceExpression(seq) => {
-          if let Some(last) = seq.expressions.last() {
-            expr = last;
-          } else {
-            return;
-          }
-        }
-        _ => break,
-      }
-    }
-    if let Expression::Identifier(ident) = expr {
-      if let Some(ref_id) = ident.reference_id.get() {
-        if let Some(sym) = scopes.symbol_id_for(ref_id) {
-          set.remove(&sym);
-        }
-      }
-    }
-  }
-
   fn invalidate_call_args_in_expr(
     expr: &Expression,
     set: &mut FxHashSet<SymbolId>,
@@ -1132,16 +1149,16 @@ mod test {
         for arg in &call.arguments {
           match arg {
             ast::Argument::SpreadElement(spread) => {
-              unwrap_and_invalidate(&spread.argument, set, scopes);
+              walk_and_invalidate(&spread.argument, set, scopes);
             }
             _ => {
-              unwrap_and_invalidate(arg.to_expression(), set, scopes);
+              walk_and_invalidate(arg.to_expression(), set, scopes);
             }
           }
         }
         // Also invalidate when the object is the receiver of a method call
         if let Some(member) = call.callee.as_member_expression() {
-          unwrap_and_invalidate(member.object(), set, scopes);
+          walk_and_invalidate(member.object(), set, scopes);
         }
         invalidate_call_args_in_expr(&call.callee, set, scopes);
       }
@@ -1319,6 +1336,29 @@ mod test {
         .last()
         .unwrap()
         .has_side_effect()
+    );
+    // Logical/conditional expressions must not defeat the analysis
+    assert!(
+      get_statements_side_effect_details("const o = { a: 1 }; mutate(o && o); ({ ...o })")
+        .last()
+        .unwrap()
+        .has_side_effect()
+    );
+    assert!(
+      get_statements_side_effect_details(
+        "const o = { a: 1 }; mutate(true ? o : other); ({ ...o })",
+      )
+      .last()
+      .unwrap()
+      .has_side_effect()
+    );
+    assert!(
+      get_statements_side_effect_details(
+        "const o = { a: 1 }; (o && o).__defineGetter__('x', function() {}); ({ ...o })",
+      )
+      .last()
+      .unwrap()
+      .has_side_effect()
     );
   }
 
